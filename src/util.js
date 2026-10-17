@@ -1,4 +1,4 @@
-export const VERSION = 'cai v1';
+export const VERSION = 'cai v1.1';
 export function dayKey(timeZone, now = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
 }

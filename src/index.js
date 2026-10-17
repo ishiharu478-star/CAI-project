@@ -5,6 +5,7 @@ import { GeminiService } from './gemini.js';
 import { createMessageHandler } from './bot.js';
 import { adminCommand, createAdminHandler } from './admin.js';
 import { createHealthServer } from './health.js';
+import { createConnectionDiagnostics } from './diagnostics.js';
 import { safeError, VERSION } from './util.js';
 
 let config;
@@ -21,7 +22,10 @@ const store = new Store(config.databaseUrl, { defaults: { dailyRequestLimit: con
 const gemini = new GeminiService({ apiKey: config.apiKey, model: config.model, maxOutputTokens: config.maxOutputTokens, store });
 let stopping = false;
 let databaseReady = false;
-const health = createHealthServer({ client, isStopping: () => stopping, dbReady: () => databaseReady });
+let loginStarted = false;
+const diagnostics = createConnectionDiagnostics({ client });
+const health = createHealthServer({ client, isStopping: () => stopping, dbReady: () => databaseReady,
+  connectionState: () => diagnostics.snapshot() });
 const handler = createMessageHandler({ store, gemini, config });
 const admin = createAdminHandler({ store, config, client });
 const inFlight = new Set();
@@ -32,7 +36,7 @@ client.on(Events.Error, error => console.error('Discord error', safeError(error)
 client.on(Events.Warn, () => console.warn('Discord reported a connection warning'));
 client.once(Events.ClientReady, async ready => {
   console.log(`${VERSION} connected`);
-  ready.user.setPresence({ activities: [{ name: 'cai v1 | メンションで話してな' }], status: 'online' });
+  ready.user.setPresence({ activities: [{ name: `${VERSION} | メンションで話してな` }], status: 'online' });
   try {
     const guild = await client.guilds.fetch(config.adminGuildId);
     const commands = await guild.commands.fetch();
@@ -55,6 +59,7 @@ function runMediaCleanup() {
 async function shutdown() {
   if (stopping) return;
   stopping = true;
+  diagnostics.stop();
   clearInterval(cleanupTimer);
   health.close();
   // Force termination only after Render's normal graceful window. Pending
@@ -64,7 +69,7 @@ async function shutdown() {
   let graceTimer;
   await Promise.race([Promise.allSettled([...inFlight]), new Promise(resolve => { graceTimer = setTimeout(resolve, 22000); })]);
   clearTimeout(graceTimer);
-  client.destroy();
+  await client.destroy().catch(() => {});
   await store.close().catch(() => {});
 }
 process.on('SIGTERM', shutdown);
@@ -79,8 +84,11 @@ try {
   runMediaCleanup();
   cleanupTimer = setInterval(runMediaCleanup, 3600000);
   cleanupTimer.unref();
+  loginStarted = true;
+  diagnostics.start();
   await client.login(config.discordToken);
 } catch (error) {
+  if (loginStarted) diagnostics.fail(error);
   console.error('Startup failed: check Render variables, Neon connection, Discord token and Message Content Intent', safeError(error));
   await shutdown(); process.exitCode = 1;
 }
