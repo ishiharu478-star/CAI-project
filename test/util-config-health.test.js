@@ -67,11 +67,30 @@ test('/health reports liveness and Discord state without upstream requests', () 
     return response;
   }
   assert.equal(request('/health').status, 200);
-  assert.deepEqual(JSON.parse(request('/health').body), { ok: true, version: 'cai v1', discord: 'connecting' });
+  assert.deepEqual(JSON.parse(request('/health').body), { ok: true, version: 'cai v1.1', discord: 'connecting' });
   assert.equal(request('/health', 'HEAD').body, undefined);
   assert.equal(request('/unknown').status, 404);
   stopping = true;
   assert.equal(request('/health').status, 503);
+});
+
+test('/health can expose safe connection diagnostics while preserving liveness during retries', () => {
+  let ready = false;
+  const state = { phase: 'rate_limited', waitingSeconds: 65, retryAfterSeconds: 120, lastCode: 'HTTP_429' };
+  const server = createHealthServer({ client: { isReady: () => ready }, connectionState: () => ({ ...state }) });
+  const read = () => {
+    const response = { writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } };
+    server.emit('request', { url: '/health', method: 'GET' }, response);
+    return response;
+  };
+  assert.equal(read().status, 200);
+  assert.equal(read().body.discord, 'connecting');
+  assert.deepEqual(read().body.connection, state);
+  ready = true;
+  state.phase = 'ready'; state.waitingSeconds = 0; state.retryAfterSeconds = 0;
+  delete state.lastCode;
+  assert.equal(read().body.discord, 'ready');
+  assert.equal(read().body.version, 'cai v1.1');
 });
 
 test('installed discord.js accepts intended minimal client settings', () => {
