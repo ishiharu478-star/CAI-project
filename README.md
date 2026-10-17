@@ -1,4 +1,20 @@
-# cai v1
+# cai v1.1
+
+## v1からの更新：Discord接続の診断表示
+
+v1.1は、Discordに接続できないときに原因を調べるための更新や。まだRender上の接続原因を特定・解消したとは限らない。Botの機能や環境変数を追加設定する必要はない。
+
+更新用ZIPを展開し、中の **`src`・`test`・`package.json`・`package-lock.json`・`README.md`の5個** を、GitHubのCAI-project → Add file → Upload filesへまとめてドラッグする。フォルダーの形を保ったままCommit changesし、Renderでこの更新のデプロイが終わるのを待つ。更新用のsrcフォルダーに入っていない既存ファイルは、そのままGitHubに残る。
+
+ログに`cai v1.1 health endpoint listening`が出れば更新が反映されてる。続く **`[cai Discord]`で始まるログ** と、`/health`の表示を確認してな。接続に時間がかかる間は約30秒ごとに状況を出すので、デプロイ完了後60〜90秒ほどのログを見れば調べやすい。通信制限の待ち時間が出ている場合は、その待機が終わる前に再デプロイを繰り返さない。
+
+診断に使うのは固定した接続段階、経過秒、待機秒、許可したエラーコードだけ。トークン・APIキー・接続文字列・Discordの生デバッグログ・会話本文は出さない。診断のために新しいAPI問い合わせやログインの再試行は追加していない。
+
+`/health`では`version`が`cai v1.1`に変わり、`connection`に段階などが追加される。`ok:true`はHTTPと初期DB準備の状態で、Discordへの接続成功は`discord:"ready"`またはログの`cai v1.1 connected`で確認する。Discordの再接続中にRenderの再起動が連鎖しないよう、HTTPの応答基準は従来どおりにしている。
+
+エラーの見方：`4004`や`INVALID_TOKEN`ならBot Token、`4014`や`DISALLOWED_INTENTS`ならそのトークンのBotのMessage Content Intent、`429`や`rate_limited`ならDiscordの待機指示、`ENOTFOUND`や`ETIMEDOUT`などはネットワークの確認が必要になる。`RATE_LIMITED`はSDKの通常の待機でも表示され、実際にHTTP 429応答を確認した場合とは区別している。表示だけでRender全体の障害やキーの有効性までは断定しないでな。
+
+v1.1の検証：自動テスト81件成功、実PostgreSQLのテスト1件は接続情報がないためスキップ。実際のDiscord・Neon・Geminiへは接続していない。Discord SDKの429応答を模擬通信で再現し、通常の制限イベントが出ない場合にも待機時間を診断できること、秘密情報を含む入力がログや公開状態へ出ないことを確認した。
 
 関西弁で話す非公開Discord Bot。Node.js + discord.js、Gemini API、Neon PostgreSQLで動くで。返答は内容に合わせた長さで、ジョジョネタはたまに。
 
@@ -101,7 +117,7 @@ Web ServiceでGitHubのCAI-projectを接続する。
 
 `.node-version`でNode.js **24.18.0**を指定している。PORTはRenderが渡す値を利用する。Secret Filesは不要。
 
-5つの環境変数を確認してDeployする。起動ログに`cai v1 connected`が出たらDiscordで`@cai こんにちは`を送る。管理サーバーで`/cai status`も確認する。`https://サービス名.onrender.com/health`は稼働状態を返すが、Geminiへの試し問い合わせは行わない。
+5つの環境変数を確認してDeployする。起動ログに`cai v1.1 connected`が出たらDiscordで`@cai こんにちは`を送る。管理サーバーで`/cai status`も確認する。`https://サービス名.onrender.com/health`は稼働状態を返すが、Geminiへの試し問い合わせは行わない。
 
 **Render Freeでは常時オンラインを保証できへん。** 15分間受信トラフィックがないWeb Serviceは休止する。caiからDiscordへの接続は、休止後にDiscordで呼ぶだけで復帰できる仕組みにはなっていない。休止した場合はRenderのサービスURLを開いて復帰を待つ。休止回避用の自動アクセスは同梱していない。[Render公式のFree制限](https://render.com/docs/free)
 
@@ -163,7 +179,7 @@ npm test
 
 この配布物の自動テストで、本番のDiscord・Gemini・Neonへの接続を保証しているわけではない。初回デプロイ後に本人の設定で動作確認してな。
 
-配布時（2026年10月17日）の検証：自動テスト69件成功、実PostgreSQL接続テスト1件は接続情報がないためスキップ。依存パッケージを実際に読み込み、Gemini SDKの模擬HTTPでアップロードと再試行抑止も確認した。公開RSSの取得では無関係な検索結果が返る場合もあったため、話題との関連性を確認し、使える結果がないときは未確認として扱う。
+v1配布時（2026年10月17日）の検証：自動テスト69件成功、実PostgreSQL接続テスト1件は接続情報がないためスキップ。依存パッケージを実際に読み込み、Gemini SDKの模擬HTTPでアップロードと再試行抑止も確認した。公開RSSの取得では無関係な検索結果が返る場合もあったため、話題との関連性を確認し、使える結果がないときは未確認として扱う。v1.1の検証はこの説明書の冒頭に記載している。
 
 ## 困ったとき
 
