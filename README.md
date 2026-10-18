@@ -1,20 +1,57 @@
-# cai v1.1
+# cai v1.2
 
-## v1からの更新：Discord接続の診断表示
+## v1.1からの更新：オンラインでも返事がないときの診断
 
-v1.1は、Discordに接続できないときに原因を調べるための更新や。まだRender上の接続原因を特定・解消したとは限らない。Botの機能や環境変数を追加設定する必要はない。
+v1.2は、メッセージを受け取ってから返事を送るまで、どの処理が待機しているか分かるようにする更新や。Discordの429制限そのものを解除する更新ではない。追加の環境変数やAPIキーは不要。
 
 更新用ZIPを展開し、中の **`src`・`test`・`package.json`・`package-lock.json`・`README.md`の5個** を、GitHubのCAI-project → Add file → Upload filesへまとめてドラッグする。フォルダーの形を保ったままCommit changesし、Renderでこの更新のデプロイが終わるのを待つ。更新用のsrcフォルダーに入っていない既存ファイルは、そのままGitHubに残る。
 
-ログに`cai v1.1 health endpoint listening`が出れば更新が反映されてる。続く **`[cai Discord]`で始まるログ** と、`/health`の表示を確認してな。接続に時間がかかる間は約30秒ごとに状況を出すので、デプロイ完了後60〜90秒ほどのログを見れば調べやすい。通信制限の待ち時間が出ている場合は、その待機が終わる前に再デプロイを繰り返さない。
+ログに`cai v1.2 health endpoint listening`が出れば更新が反映されてる。Discordに接続したら、候補から選んだ本物のcaiメンションを1回だけ送って確認する。本文なしならGeminiを使わない相槌、本文ありなら通常の質問処理になる。Renderログの **`[cai Message]`** と **`[cai Discord]`** を確認してな。429の待機時間が出ている間は連投や再デプロイを繰り返さない。
 
-診断に使うのは固定した接続段階、経過秒、待機秒、許可したエラーコードだけ。トークン・APIキー・接続文字列・Discordの生デバッグログ・会話本文は出さない。診断のために新しいAPI問い合わせやログインの再試行は追加していない。
+### メッセージ処理の段階
 
-`/health`では`version`が`cai v1.1`に変わり、`connection`に段階などが追加される。`ok:true`はHTTPと初期DB準備の状態で、Discordへの接続成功は`discord:"ready"`またはログの`cai v1.1 connected`で確認する。Discordの再接続中にRenderの再起動が連鎖しないよう、HTTPの応答基準は従来どおりにしている。
+`[cai Message]`は、cai宛てと判定したメッセージだけを対象に、受信、各段階の開始・完了・失敗、処理の終了を記録する。15秒以上同じ処理が終わらなければ、その段階で待機中という警告を1回出す。この警告で処理を中止したり、再送したりはしない。
 
-エラーの見方：`4004`や`INVALID_TOKEN`ならBot Token、`4014`や`DISALLOWED_INTENTS`ならそのトークンのBotのMessage Content Intent、`429`や`rate_limited`ならDiscordの待機指示、`ENOTFOUND`や`ETIMEDOUT`などはネットワークの確認が必要になる。`RATE_LIMITED`はSDKの通常の待機でも表示され、実際にHTTP 429応答を確認した場合とは区別している。表示だけでRender全体の障害やキーの有効性までは断定しないでな。
+例えば、次の最後の行なら「入力中」の表示を送る通信で待機している。
 
-v1.1の検証：自動テスト81件成功、実PostgreSQLのテスト1件は接続情報がないためスキップ。実際のDiscord・Neon・Geminiへは接続していない。Discord SDKの429応答を模擬通信で再現し、通常の制限イベントが出ない場合にも待機時間を診断できること、秘密情報を含む入力がログや公開状態へ出ないことを確認した。
+```text
+[cai Message] m1 received
+[cai Message] m1 stage=settings started
+[cai Message] m1 stage=settings completed
+[cai Message] m1 stage=typing started
+[cai Message] m1 stage=typing waiting elapsedSeconds=15
+```
+
+`stage=reply completed`はその返信の送信完了、`handler_finished`は処理の終了を示す。途中で失敗して終了した場合もあるので、`handler_finished`だけで回答が届いたとは判断しない。
+
+| 段階 | 待っている処理 |
+| --- | --- |
+| `reference` | メンションに付いた返信先の取得 |
+| `settings` / `quota` | Neonの設定・質問回数の確認 |
+| `typing` | Discordへ「入力中」を表示する通信 |
+| `history` / `memory_search` | 必要な会話文脈・過去ログの取得 |
+| `budget` | 無料枠の確認と、枠を確保した生成処理全体 |
+| `web` / `gemini` | 必要時のWeb取得・Gemini生成 |
+| `reply` / `followup` | 最初の返信・長い回答の続きの送信 |
+| `save` / `accounting` / `refund` | 保存・トークン集計・失敗時の質問回数返却 |
+
+通常の雑談・DM・許可していないサーバーなどにはメッセージ診断を出さない。メンションなしの返信は、返信先がcaiと確認できた時点で記録を始める。診断用の番号はプロセス内だけの連番で、Discordのユーザー・メッセージ・チャンネル・サーバーIDではない。本文・引用・添付名やURL・Token・APIキー・接続文字列・生のエラーやデバッグ本文は、新しい診断に渡さない。
+
+### 接続成功とAPI待機を別々に確認
+
+`/health`の`version`は`cai v1.2`になる。`discord:"ready"`はDiscord Gatewayへの接続状態で、返信を送れることやGeminiの応答成功までは保証しない。**`connection.rest.limited:true`なら、DiscordのHTTP APIでSDKが待機中**や。
+
+`connection.rest.retryAfterSeconds`は残り待機秒数。取得できた場合だけ、固定した操作名`operation`、許可した`scope`と`global`、`lastCode`を付ける。操作名は`gateway_info`・`typing`・`message_send`・`message_read`・`admin_commands`などで、DiscordのIDやURLは公開しない。`unknown`や`other`の場合は、その情報だけで返信送信の制限と断定しない。
+
+`lastCode:429`は実際のHTTP 429応答を確認した場合、`RATE_LIMITED`はSDKの通常の予告待機の場合。待機が終わると`limited:false`になるが、最後に観測した情報は履歴として残るので、`lastCode`だけで現在も制限中とは判断しない。`scope:shared`はDiscordのリソース単位の制限を示し、Renderの共有IPが原因という意味ではない。[DiscordのRate Limits](https://docs.discord.com/developers/topics/rate-limits)
+
+`scope`はSDKが提供した値で、HTTPヘッダーをそのまま記録したものではない。特に`user`はSDKの既定値の場合もあるため、そのヘッダーが実際に返った証拠とは扱わない。
+
+`ok:true`の基準はHTTPと初期DB準備の状態のまま。待機中にRenderが再起動を繰り返さないよう、Discordの接続・送信待機をHTTPの異常にはしない。SDKの待機や再試行、Botの返答や質問制限は従来どおりで、診断用のAPI問い合わせ・ログイン・メッセージ送信は追加しない。
+
+エラーの見方：`4004`や`INVALID_TOKEN`ならBot Token、`4014`や`DISALLOWED_INTENTS`ならMessage Content Intent、`429`や`rate_limited`ならDiscordの待機指示、`ENOTFOUND`や`ETIMEDOUT`などはネットワークの確認が必要になる。診断表示だけでRender全体の障害や制限の原因を断定しないでな。
+
+v1.2の検証（2026年10月18日）：自動テスト104件中103件成功、実PostgreSQL接続テスト1件は専用テストDBがないためスキップ。実際に使うDiscord REST SDKの通信を模擬し、typingと返信送信の429、GatewayがreadyのままRESTが待機する状態、ログと公開状態への秘密情報の混入防止、処理待機中の段階表示を確認した。この更新の検証では本番のDiscord・Neon・Geminiへ接続していない。
 
 関西弁で話す非公開Discord Bot。Node.js + discord.js、Gemini API、Neon PostgreSQLで動くで。返答は内容に合わせた長さで、ジョジョネタはたまに。
 
@@ -98,7 +135,7 @@ CAI-project/
   test/
 ```
 
-`CAI-project-v1`フォルダーをもう1階層挟まない。`.env`、`node_modules/`、実際のAPIキーや接続文字列はアップロードしない。`.gitignore`はGitからの誤追加を防ぐが、ブラウザーからの手動アップロードは自分でも確認してな。
+`CAI-project-v1.2`フォルダーをもう1階層挟まない。`.env`、`node_modules/`、実際のAPIキーや接続文字列はアップロードしない。`.gitignore`はGitからの誤追加を防ぐが、ブラウザーからの手動アップロードは自分でも確認してな。
 
 ## 4. Renderで起動
 
@@ -117,7 +154,7 @@ Web ServiceでGitHubのCAI-projectを接続する。
 
 `.node-version`でNode.js **24.18.0**を指定している。PORTはRenderが渡す値を利用する。Secret Filesは不要。
 
-5つの環境変数を確認してDeployする。起動ログに`cai v1.1 connected`が出たらDiscordで`@cai こんにちは`を送る。管理サーバーで`/cai status`も確認する。`https://サービス名.onrender.com/health`は稼働状態を返すが、Geminiへの試し問い合わせは行わない。
+5つの環境変数を確認してDeployする。起動ログに`cai v1.2 connected`が出たらDiscordで`@cai こんにちは`を送る。管理サーバーで`/cai status`も確認する。`https://サービス名.onrender.com/health`は稼働状態を返すが、Geminiへの試し問い合わせは行わない。
 
 **Render Freeでは常時オンラインを保証できへん。** 15分間受信トラフィックがないWeb Serviceは休止する。caiからDiscordへの接続は、休止後にDiscordで呼ぶだけで復帰できる仕組みにはなっていない。休止した場合はRenderのサービスURLを開いて復帰を待つ。休止回避用の自動アクセスは同梱していない。[Render公式のFree制限](https://render.com/docs/free)
 
@@ -179,7 +216,7 @@ npm test
 
 この配布物の自動テストで、本番のDiscord・Gemini・Neonへの接続を保証しているわけではない。初回デプロイ後に本人の設定で動作確認してな。
 
-v1配布時（2026年10月17日）の検証：自動テスト69件成功、実PostgreSQL接続テスト1件は接続情報がないためスキップ。依存パッケージを実際に読み込み、Gemini SDKの模擬HTTPでアップロードと再試行抑止も確認した。公開RSSの取得では無関係な検索結果が返る場合もあったため、話題との関連性を確認し、使える結果がないときは未確認として扱う。v1.1の検証はこの説明書の冒頭に記載している。
+v1配布時（2026年10月17日）の検証：自動テスト69件成功、実PostgreSQL接続テスト1件は接続情報がないためスキップ。依存パッケージを実際に読み込み、Gemini SDKの模擬HTTPでアップロードと再試行抑止も確認した。公開RSSの取得では無関係な検索結果が返る場合もあったため、話題との関連性を確認し、使える結果がないときは未確認として扱う。
 
 ## 困ったとき
 
