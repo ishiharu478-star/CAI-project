@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createMessageHandler, sendReply } from '../src/bot.js';
+import { createMessageDiagnostics } from '../src/message-diagnostics.js';
 
 const BOT = '999999999999999999';
 const USER = '111111111111111111';
@@ -29,7 +30,8 @@ function setup(overrides = {}) {
   const config = { allowedGuildIds: [], maxConcurrent: 2, rpmLimit: 5, ...overrides.config };
   const validate = overrides.validate ?? ((items) => record('validate', items));
   const handler = createMessageHandler({ store, gemini, web, config, validate,
-    now: overrides.now ?? (() => NOW), logger: { error: (...args) => record('error', args) } });
+    now: overrides.now ?? (() => NOW), diagnostics: overrides.diagnostics,
+    logger: overrides.logger ?? { error: (...args) => record('error', args) } });
   let nextMessageId = 0;
   function message(options = {}) {
     const sent = [];
@@ -247,4 +249,182 @@ test('all answer chunks disable user and global pings', async () => {
     assert.ok(payload.content.length <= 1900);
     assert.deepEqual(payload.allowedMentions, { parse: [], repliedUser: false });
   }
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+function messageTracking() {
+  let stamp = 1000;
+  let nextTimer = 0;
+  let finished = 0;
+  const timers = new Map();
+  const logs = [];
+  const beginArguments = [];
+  const stages = [];
+  const logger = Object.fromEntries(['log', 'info', 'warn', 'error'].map(level => [level, (...args) => logs.push([level, ...args])]));
+  const real = createMessageDiagnostics({ logger, now: () => stamp,
+    setTimeoutImpl(callback, ms) {
+      assert.equal(ms, 15000);
+      const timer = { id: ++nextTimer, unref() {} }; timers.set(timer, callback); return timer;
+    },
+    clearTimeoutImpl(timer) { timers.delete(timer); },
+  });
+  const diagnostics = { begin(...args) {
+    beginArguments.push(args);
+    const trace = real.begin(...args);
+    return { run(stage, task) { stages.push(stage); return trace.run(stage, task); },
+      finish() { finished++; trace.finish(); } };
+  } };
+  return { diagnostics, logs, stages, timers, beginArguments, get finished() { return finished; },
+    wait() { stamp += 15000; for (const [timer, callback] of [...timers]) { timers.delete(timer); callback(); } } };
+}
+
+test('message diagnostics leave blocked initial typing pending until the SDK operation resolves', async () => {
+  const tracking = messageTracking();
+  const context = setup({ diagnostics: tracking.diagnostics });
+  const { msg, sent } = context.message({ content: `<@${BOT}> PRIVATE_PROMPT` });
+  const entered = deferred(); const blocked = deferred();
+  msg.channel.sendTyping = async () => { context.record('typing', []); entered.resolve(); await blocked.promise; };
+  let completed = false;
+  const pending = context.handler(msg, BOT).then(() => { completed = true; });
+  await entered.promise;
+  try {
+    tracking.wait();
+    assert.equal(completed, false);
+    assert.equal(count(context.calls, 'reserveQuestion'), 1);
+    assert.equal(count(context.calls, 'generate'), 0);
+    assert.equal(count(context.calls, 'withGenerationBudget'), 0);
+    assert.equal(sent.length, 0);
+    assert.equal(tracking.finished, 0);
+    assert(tracking.logs.some(([level, ...args]) => level === 'warn' && args.join(' ').includes('typing')));
+    assert.equal(count(context.calls, 'typing'), 1);
+  } finally { blocked.resolve(); await pending; }
+  assert.equal(count(context.calls, 'generate'), 1);
+  assert.equal(count(context.calls, 'reserveQuestion'), 1);
+  assert.equal(count(context.calls, 'refundQuestion'), 0);
+  assert.equal(sent.length, 1);
+  assert.equal(tracking.finished, 1);
+  assert.equal(tracking.timers.size, 0);
+  assert(!new RegExp(`PRIVATE_PROMPT|${BOT}|${USER}|${GUILD}|${CHANNEL}|message-1`).test(JSON.stringify(tracking.logs)));
+  assert.deepEqual(tracking.beginArguments, [[]]);
+});
+
+test('mention-only acknowledgement waits for its real reply without Gemini calls or early trace completion', async () => {
+  const tracking = messageTracking();
+  const context = setup({ diagnostics: tracking.diagnostics });
+  const { msg, sent } = context.message({ content: `<@!${BOT}>` });
+  const entered = deferred(); const blocked = deferred();
+  const originalReply = msg.reply;
+  msg.reply = async payload => { entered.resolve(); await blocked.promise; return originalReply(payload); };
+  const pending = context.handler(msg, BOT);
+  await entered.promise;
+  try {
+    tracking.wait();
+    assert.equal(count(context.calls, 'generate'), 0);
+    assert.equal(count(context.calls, 'reserveQuestion'), 0);
+    assert.equal(count(context.calls, 'withGenerationBudget'), 0);
+    assert.equal(count(context.calls, 'saveExchange'), 0);
+    assert.equal(sent.length, 0);
+    assert.equal(tracking.finished, 0);
+    assert(tracking.logs.some(([level, ...args]) => level === 'warn' && args.join(' ').includes('reply')));
+  } finally { blocked.resolve(); await pending; }
+  assert.equal(sent.length, 1);
+  assert.equal(count(context.calls, 'saveExchange'), 1);
+  assert.equal(count(context.calls, 'generate'), 0);
+  assert.equal(tracking.finished, 1);
+  assert.equal(tracking.timers.size, 0);
+  assert.deepEqual(tracking.stages, ['settings', 'reply', 'save']);
+});
+
+test('unrelated messages and other-user replies produce no message diagnostics', async () => {
+  const tracking = messageTracking();
+  const context = setup({ diagnostics: tracking.diagnostics });
+  const target = { id: 'PRIVATE_OTHER_MESSAGE', author: { id: 'PRIVATE_OTHER_USER' }, guildId: GUILD, channelId: CHANNEL };
+  for (const patch of [
+    { guildId: null }, { author: { id: USER, bot: true } }, { webhookId: 'PRIVATE_WEBHOOK' },
+    { system: true }, { content: 'PRIVATE_CHAT' },
+    { content: 'PRIVATE_REPLY', reference: { messageId: target.id }, referenced: target },
+  ]) await context.handler(context.message(patch).msg, BOT);
+  const restricted = setup({ diagnostics: tracking.diagnostics, config: { allowedGuildIds: ['PRIVATE_OTHER_GUILD'] } });
+  await restricted.handler(restricted.message().msg, BOT);
+  assert.deepEqual(tracking.beginArguments, []);
+  assert.deepEqual(tracking.logs, []);
+  assert.equal(tracking.finished, 0);
+  assert.equal(count(context.calls, 'getSettings'), 0);
+  assert.equal(count(context.calls, 'fetchReference'), 1);
+});
+
+test('own mentions trace pending reference fetch but unmentioned cai replies begin after target recognition', async () => {
+  const tracking = messageTracking();
+  const context = setup({ diagnostics: tracking.diagnostics });
+  const target = { id: 'PRIVATE_TARGET', author: { id: BOT }, guildId: GUILD, channelId: CHANNEL, content: 'PRIVATE_QUOTE' };
+  const mentioned = context.message({ reference: { messageId: target.id }, referenced: target });
+  const entered = deferred(); const blocked = deferred();
+  mentioned.msg.fetchReference = async () => { entered.resolve(); await blocked.promise; return target; };
+  const pending = context.handler(mentioned.msg, BOT);
+  await entered.promise;
+  try {
+    tracking.wait();
+    assert.deepEqual(tracking.stages, ['reference']);
+    assert(tracking.logs.some(([level, ...args]) => level === 'warn' && args.join(' ').includes('reference')));
+    assert.equal(count(context.calls, 'getSettings'), 0);
+  } finally { blocked.resolve(); await pending; }
+  const firstTraceStages = tracking.stages.length;
+  const unmentioned = context.message({ content: 'PRIVATE_FOLLOWUP', reference: { messageId: target.id }, referenced: target });
+  await context.handler(unmentioned.msg, BOT);
+  assert.equal(tracking.stages[firstTraceStages], 'settings');
+  assert.equal(tracking.finished, 2);
+  assert.equal(tracking.timers.size, 0);
+  assert(!/PRIVATE_/.test(JSON.stringify(tracking.logs)));
+});
+
+test('failed generation preserves reply and refund while recording terminal cleanup without error contents', async () => {
+  const tracking = messageTracking();
+  const context = setup({ diagnostics: tracking.diagnostics,
+    gemini: { generate: async () => { throw Object.assign(new Error('PRIVATE_API_KEY https://private.example/'), { status: 503 }); } } });
+  const { msg, sent } = context.message();
+  await context.handler(msg, BOT);
+  assert.equal(sent.length, 1);
+  assert.equal(count(context.calls, 'reserveQuestion'), 1);
+  assert.equal(count(context.calls, 'refundQuestion'), 1);
+  assert.equal(count(context.calls, 'saveExchange'), 0);
+  assert(tracking.stages.includes('gemini'));
+  assert.deepEqual(tracking.stages.slice(-2), ['reply', 'refund']);
+  assert.equal(tracking.finished, 1);
+  assert.equal(tracking.timers.size, 0);
+  assert(!/PRIVATE_|private\.example/.test(JSON.stringify(tracking.logs)));
+});
+
+test('duplicate, acknowledgement cooldown and maintenance early returns always finish their trace', async () => {
+  const tracking = messageTracking();
+  const context = setup({ diagnostics: tracking.diagnostics });
+  const first = context.message({ content: `<@${BOT}>` });
+  await context.handler(first.msg, BOT);
+  await context.handler(first.msg, BOT);
+  await context.handler(context.message({ content: `<@${BOT}>` }).msg, BOT);
+  assert.equal(tracking.finished, 3);
+  const maintenance = setup({ diagnostics: tracking.diagnostics,
+    store: { getSettings: async () => ({ maintenance: true, maintenanceMessage: '休憩中' }) } });
+  await maintenance.handler(maintenance.message().msg, BOT);
+  assert.equal(tracking.finished, 4);
+  assert.equal(tracking.timers.size, 0);
+  assert.equal(count(context.calls, 'generate'), 0);
+});
+
+test('sendReply traces real first and later chunks without changing payloads', async () => {
+  const tracking = messageTracking();
+  const context = setup(); const { msg, sent } = context.message();
+  const trace = tracking.diagnostics.begin();
+  try {
+    const ids = await sendReply(msg, 'あ'.repeat(4200), trace);
+    assert.equal(ids.length, 3);
+    assert.equal(sent.length, 3);
+    assert.deepEqual(tracking.stages, ['reply', 'followup', 'followup']);
+    for (const payload of sent) assert.deepEqual(payload.allowedMentions, { parse: [], repliedUser: false });
+  } finally { trace.finish(); }
+  assert.equal(tracking.timers.size, 0);
 });

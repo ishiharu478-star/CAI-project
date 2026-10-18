@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { Client, GatewayIntentBits, Options } from 'discord.js';
 import { loadConfig } from '../src/config.js';
 import { dayKey, explicitMention, stripBotMention, memoryQuery, splitMessage, safeError, errorText } from '../src/util.js';
 import { createHealthServer } from '../src/health.js';
+import { createConnectionDiagnostics } from '../src/diagnostics.js';
 
 const env = { DISCORD_TOKEN: 'secret-token', GEMINI_API_KEY: 'secret-key', DATABASE_URL: 'postgresql://user:secret-password@example.com/test?sslmode=require', OWNER_USER_ID: '123456789012345678', ADMIN_GUILD_ID: '987654321098765432' };
 
@@ -67,7 +69,7 @@ test('/health reports liveness and Discord state without upstream requests', () 
     return response;
   }
   assert.equal(request('/health').status, 200);
-  assert.deepEqual(JSON.parse(request('/health').body), { ok: true, version: 'cai v1.1', discord: 'connecting' });
+  assert.deepEqual(JSON.parse(request('/health').body), { ok: true, version: 'cai v1.2', discord: 'connecting' });
   assert.equal(request('/health', 'HEAD').body, undefined);
   assert.equal(request('/unknown').status, 404);
   stopping = true;
@@ -90,7 +92,42 @@ test('/health can expose safe connection diagnostics while preserving liveness d
   state.phase = 'ready'; state.waitingSeconds = 0; state.retryAfterSeconds = 0;
   delete state.lastCode;
   assert.equal(read().body.discord, 'ready');
-  assert.equal(read().body.version, 'cai v1.1');
+  assert.equal(read().body.version, 'cai v1.2');
+});
+
+test('/health stays live and separates ready Gateway from actual REST429 waiting', () => {
+  let clock = 0;
+  const client = new EventEmitter();
+  client.rest = new EventEmitter();
+  client.isReady = () => true;
+  const diagnostics = createConnectionDiagnostics({ client, now: () => clock,
+    logger: { log() {}, warn() {}, error() {} },
+    setIntervalImpl: () => ({ unref() {} }), clearIntervalImpl() {} });
+  diagnostics.start();
+  client.rest.emit('restDebug', '[REST PRIVATE_BUCKET/PRIVATE_ID] Encountered unexpected 429 rate limit\n'
+    + '  Method : POST\n  Bucket : /channels/:id/typing\n  Retry After : 45000ms\n'
+    + '  URL : https://discord.com/api/v10/channels/123456789012345678/typing?token=PRIVATE_TOKEN');
+  const server = createHealthServer({ client, connectionState: () => diagnostics.snapshot() });
+  const read = () => {
+    const response = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    server.emit('request', { url: '/health', method: 'GET' }, response);
+    return response;
+  };
+  try {
+    const response = read();
+    const body = JSON.parse(response.body);
+    assert.equal(response.status, 200);
+    assert.equal(body.version, 'cai v1.2');
+    assert.equal(body.discord, 'ready');
+    assert.equal(body.connection.phase, 'ready');
+    assert.equal(body.connection.rest.limited, true);
+    assert.equal(body.connection.rest.retryAfterSeconds, 45);
+    assert.equal(body.connection.rest.operation, 'typing');
+    assert.equal(body.connection.rest.lastCode, 429);
+    assert(!/PRIVATE|123456789012345678|https:|token=/.test(response.body));
+    clock = 46000;
+    assert.equal(JSON.parse(read().body).connection.rest.limited, false);
+  } finally { diagnostics.stop(); }
 });
 
 test('installed discord.js accepts intended minimal client settings', () => {

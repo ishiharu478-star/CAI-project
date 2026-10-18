@@ -10,6 +10,13 @@ const CLOSE_CODES = new Set([1000, 1001, 1006, 1011, 1012, 1013, 4000, 4001, 400
   4005, 4007, 4008, 4009, 4010, 4011, 4012, 4013, 4014]);
 const ERROR_NAMES = new Set(['Error', 'TypeError', 'RangeError', 'AbortError', 'TimeoutError',
   'DiscordAPIError', 'DiscordjsError', 'HTTPError', 'RateLimitError']);
+const REST_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+const REST_SCOPES = new Set(['user', 'global', 'shared']);
+const ROUTE_ID = '(?:[0-9]{17,20}|:id)';
+const TYPING_ROUTE = new RegExp(`^/channels/${ROUTE_ID}/typing$`);
+const MESSAGE_ROUTE = new RegExp(`^/channels/${ROUTE_ID}/messages$`);
+const MESSAGE_READ_ROUTE = new RegExp(`^/channels/${ROUTE_ID}/messages(?:/${ROUTE_ID})?$`);
+const COMMAND_ROUTE = new RegExp(`^/applications/${ROUTE_ID}/(?:guilds/${ROUTE_ID}/)?commands(?:/${ROUTE_ID})?$`);
 const PHASE_MESSAGES = Object.freeze({
   idle: '診断待機中', requesting_gateway: '接続開始: Discord Gateway情報を取得中',
   gateway_received: 'Gateway情報を取得したで', connecting_gateway: 'Discord Gatewayへ接続中',
@@ -56,6 +63,38 @@ function hint(code) {
 function boundedMs(value) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.min(MAX_WAIT_MS, Math.max(0, value)) : 0;
 }
+function restOperation(data) {
+  const method = ownValue(data, 'method');
+  const route = ownValue(data, 'route');
+  // Never derive a route from a URL, interpolate a route, or stringify objects.
+  // Both concrete snowflakes and the SDK's :id bucket placeholders are accepted.
+  if (!REST_METHODS.has(method) || typeof route !== 'string' || route.length > 512
+    || route[0] !== '/' || /[^A-Za-z0-9:_/-]/.test(route)) return 'unknown';
+  if (method === 'GET' && route === '/gateway/bot') return 'gateway_info';
+  if (method === 'POST' && TYPING_ROUTE.test(route)) return 'typing';
+  if (method === 'POST' && MESSAGE_ROUTE.test(route)) return 'message_send';
+  if (method === 'GET' && MESSAGE_READ_ROUTE.test(route)) return 'message_read';
+  if (['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && COMMAND_ROUTE.test(route)) return 'admin_commands';
+  return 'other';
+}
+function restMetadata(data, observed429) {
+  const result = { lastCode: observed429 ? 429 : 'RATE_LIMITED', operation: restOperation(data) };
+  const scope = ownValue(data, 'scope');
+  const global = ownValue(data, 'global');
+  if (REST_SCOPES.has(scope)) result.scope = scope;
+  if (typeof global === 'boolean') result.global = global;
+  return result;
+}
+function sdkField(lines, name) {
+  const pattern = new RegExp(`^[ \\t]*${name}[ \\t]*:[ \\t]*(.*)$`);
+  const values = lines.flatMap(line => { const match = pattern.exec(line); return match ? [match[1]] : []; });
+  // Ambiguous duplicate fields cannot be used to classify a request.
+  return values.length === 1 ? values[0] : undefined;
+}
+function sdkWait(value) {
+  return typeof value === 'string' && /^\d{1,16}(?:\.\d{1,6})?ms$/.test(value)
+    ? boundedMs(Number(value.slice(0, -2))) : 0;
+}
 
 export function createConnectionDiagnostics({ client, logger = console, now = Date.now, intervalMs = 30000,
   setIntervalImpl = setInterval, clearIntervalImpl = clearInterval }) {
@@ -64,6 +103,8 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
   let stopped = false;
   let startedAt;
   let retryUntil = 0;
+  let restRetryUntil = 0;
+  let restLast;
   let phaseBeforeRateLimit = 'requesting_gateway';
   let lastCode;
   let timer;
@@ -101,6 +142,16 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
     const waitMs = Math.max(boundedMs(ownValue(data, 'retryAfter')), boundedMs(ownValue(data, 'timeToReset')),
       boundedMs(ownValue(data, 'sublimitTimeout')));
     retryUntil = Math.max(retryUntil, now() + waitMs);
+    const restUntil = now() + waitMs;
+    const metadata = restMetadata(data, observed429);
+    // One bounded summary represents the longest active SDK wait. Keep its
+    // operation and scope together; a shorter unrelated wait cannot relabel it.
+    // An actual 429 with an equal deadline supersedes a predictive queue event.
+    if (!restLast || restRetryUntil <= now() || restUntil > restRetryUntil
+      || (restUntil === restRetryUntil && (observed429 || restLast.lastCode !== 429))) {
+      restRetryUntil = restUntil;
+      restLast = metadata;
+    }
     if (observed429) lastCode = 429;
     else if (lastCode !== 429) lastCode = 'RATE_LIMITED';
     if (!ready() && phase !== 'failed') {
@@ -108,7 +159,7 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
       if (phase !== 'rate_limited') phaseBeforeRateLimit = phase === 'idle' ? 'requesting_gateway' : phase;
       changePhase('rate_limited');
     }
-    log('warn', `${observed429 ? 'HTTP 429' : 'Discord API制限'} retryAfterSeconds=${Math.min(MAX_SECONDS, Math.ceil(waitMs / 1000))}。SDKの待機中は再デプロイを繰り返さず待ってな`);
+    log('warn', `${observed429 ? 'HTTP 429' : 'Discord API制限'} operation=${metadata.operation} retryAfterSeconds=${Math.min(MAX_SECONDS, Math.ceil(waitMs / 1000))}${metadata.scope === undefined ? '' : ` scope=${metadata.scope}`}${metadata.global === undefined ? '' : ` global=${metadata.global}`}。SDKの待機中は再デプロイを繰り返さず待ってな`);
   }
   function clientDebug(value) {
     if (stopped || typeof value !== 'string' || value.length > 16384 || phase === 'failed') return;
@@ -135,8 +186,14 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
     if (stopped || typeof value !== 'string' || value.length > 16384) return;
     const first = value.split('\n', 1)[0];
     if (!/^(?:\[REST [^\]\r\n]{1,4096}\] )?Encountered unexpected 429 rate limit$/.test(first)) return;
-    const match = /^\s*Retry After\s*:\s*(\d{1,16}(?:\.\d{1,6})?)ms\s*$/m.exec(value);
-    rateLimited({ retryAfter: match ? Number(match[1]) : 0 }, true);
+    // The installed REST handlers include raw URLs, major IDs and hashes in
+    // this message. Read only fixed fields and reconstruct an allowlisted view.
+    const lines = value.split('\n').slice(1);
+    const global = sdkField(lines, 'Global');
+    rateLimited({ retryAfter: sdkWait(sdkField(lines, 'Retry After')),
+      sublimitTimeout: sdkWait(sdkField(lines, 'Sublimit')),
+      method: sdkField(lines, 'Method'), route: sdkField(lines, 'Bucket'), scope: sdkField(lines, 'Scope'),
+      global: global === 'true' ? true : global === 'false' ? false : undefined }, true);
   }
   function listen(target, event, handler) {
     if (!target?.on) return;
@@ -160,7 +217,8 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
     listen(client, 'shardResume', () => { if (ready()) markReady(); else if (!stopped) changePhase('waiting_ready'); });
     listen(client, 'clientReady', markReady);
     listen(client, 'invalidated', () => { reconnect(); lastCode = 'SESSION_INVALIDATED'; changePhase('failed'); });
-    listen(client.rest, 'rateLimited', rateLimited);
+    // A rateLimited event reports an SDK queue wait, not necessarily a 429.
+    listen(client.rest, 'rateLimited', data => rateLimited(data));
     listen(client.rest, 'restDebug', restDebug);
   }
   function snapshot() {
@@ -168,14 +226,17 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
     const currentPhase = phase === 'rate_limited' && remaining === 0 ? phaseBeforeRateLimit : phase;
     const result = { phase: currentPhase,
       waitingSeconds: startedAt === undefined || currentPhase === 'ready' || currentPhase === 'idle' ? 0 : Math.min(MAX_SECONDS, Math.max(0, Math.floor((now() - startedAt) / 1000))),
-      retryAfterSeconds: remaining };
+      retryAfterSeconds: remaining,
+      rest: { limited: restRetryUntil > now(),
+        retryAfterSeconds: Math.min(MAX_SECONDS, Math.max(0, Math.ceil((restRetryUntil - now()) / 1000))),
+        ...restLast } };
     if (lastCode !== undefined) result.lastCode = lastCode;
     return result;
   }
   function start() {
     if (started && !stopped) return;
     stopped = false; started = true; attach();
-    startedAt = now(); retryUntil = 0; lastCode = undefined;
+    startedAt = now(); retryUntil = 0; lastCode = undefined; restRetryUntil = 0; restLast = undefined;
     if (ready()) markReady(); else changePhase('requesting_gateway');
     timer = setIntervalImpl(() => {
       if (stopped || phase === 'failed') return;
@@ -190,6 +251,7 @@ export function createConnectionDiagnostics({ client, logger = console, now = Da
     timer = undefined; stopped = true; started = false;
     for (const [target, event, handler] of listeners.splice(0)) target.off(event, handler);
     attached = false; phase = 'idle'; startedAt = undefined; retryUntil = 0; lastCode = undefined;
+    restRetryUntil = 0; restLast = undefined;
   }
   function fail(error) {
     if (stopped) return;
